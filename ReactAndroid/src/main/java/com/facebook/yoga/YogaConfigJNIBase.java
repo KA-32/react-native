@@ -8,8 +8,9 @@ package com.facebook.yoga;
 
 public abstract class YogaConfigJNIBase extends YogaConfig {
 
-  protected long mNativePointer;
+  long mNativePointer;
   private YogaLogger mLogger;
+  private boolean useVanillaJNI = false;
 
   private YogaConfigJNIBase(long nativePointer) {
     if (nativePointer == 0) {
@@ -69,5 +70,15 @@ public abstract class YogaConfigJNIBase extends YogaConfig {
 
   long getNativePointer() {
     return mNativePointer;
+  }
+
+  @Override
+  public void setUseVanillaJNI(boolean useVanillaJNI) {
+    this.useVanillaJNI = useVanillaJNI;
+  }
+
+  @Override
+  public boolean useVanillaJNI() {
+    return this.useVanillaJNI;
   }
 }

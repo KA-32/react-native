@@ -99,6 +99,10 @@ import typeof DeprecatedEdgeInsetsPropType from './Libraries/DeprecatedPropTypes
 import typeof DeprecatedPointPropType from './Libraries/DeprecatedPropTypes/DeprecatedPointPropType';
 import typeof DeprecatedViewPropTypes from './Libraries/DeprecatedPropTypes/DeprecatedViewPropTypes';
 
+import type {HostComponent as _HostComponentInternal} from './Libraries/Renderer/shims/ReactNativeTypes';
+
+export type HostComponent<T> = _HostComponentInternal<T>;
+
 const invariant = require('invariant');
 const warnOnce = require('./Libraries/Utilities/warnOnce');
 
@@ -427,7 +431,9 @@ module.exports = {
   get processColor(): processColor {
     return require('./Libraries/StyleSheet/processColor');
   },
-  get requireNativeComponent(): requireNativeComponent {
+  get requireNativeComponent(): <T>(
+    uiViewClassName: string,
+  ) => HostComponent<T> {
     return require('./Libraries/ReactNative/requireNativeComponent');
   },
   get unstable_RootTagContext(): RootTagContext {

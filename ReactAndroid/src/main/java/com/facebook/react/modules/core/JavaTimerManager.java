@@ -1,45 +1,33 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
- *
- * <p>This source code is licensed under the MIT license found in the LICENSE file in the root
- * directory of this source tree.
- */
 package com.facebook.react.modules.core;
 
 import android.util.SparseArray;
 import androidx.annotation.Nullable;
 import com.facebook.react.bridge.Arguments;
-import com.facebook.react.bridge.LifecycleEventListener;
 import com.facebook.react.bridge.ReactApplicationContext;
-import com.facebook.react.bridge.ReactContextBaseJavaModule;
-import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.UiThreadUtil;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.common.SystemClock;
 import com.facebook.react.devsupport.interfaces.DevSupportManager;
 import com.facebook.react.jstasks.HeadlessJsTaskContext;
-import com.facebook.react.jstasks.HeadlessJsTaskEventListener;
-import com.facebook.react.module.annotations.ReactModule;
 import java.util.Comparator;
 import java.util.PriorityQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Native module for JS timer execution. Timers fire on frame boundaries. */
-@ReactModule(name = Timing.NAME)
-public final class Timing extends ReactContextBaseJavaModule
-    implements LifecycleEventListener, HeadlessJsTaskEventListener {
+/**
+ * This class is the native implementation for JS timer execution on Android. It schedules JS timers
+ * to be invoked on frame boundaries using {@link ReactChoreographer}.
+ *
+ * <p>This is used by the NativeModule {@link TimingModule}.
+ */
+public class JavaTimerManager {
 
-  public static final String NAME = "Timing";
-
-  // These timing contants should be kept in sync with the ones in `JSTimers.js`.
+  // These timing constants should be kept in sync with the ones in `JSTimers.js`.
   // The minimum time in milliseconds left in the frame to call idle callbacks.
   private static final float IDLE_CALLBACK_FRAME_DEADLINE_MS = 1.f;
   // The total duration of a frame in milliseconds, this assumes that devices run at 60 fps.
   // TODO: Lower frame duration on devices that are too slow to run consistently
   // at 60 fps.
   private static final float FRAME_DURATION_MS = 1000.f / 60.f;
-
-  private final DevSupportManager mDevSupportManager;
 
   private static class Timer {
     private final int mCallbackID;
@@ -85,7 +73,7 @@ public final class Timing extends ReactContextBaseJavaModule
       }
 
       if (mTimersToCall != null) {
-        getReactApplicationContext().getJSModule(JSTimers.class).callTimers(mTimersToCall);
+        mJavaScriptTimerManager.callTimers(mTimersToCall);
         mTimersToCall = null;
       }
 
@@ -107,7 +95,7 @@ public final class Timing extends ReactContextBaseJavaModule
       }
 
       mCurrentIdleCallbackRunnable = new IdleCallbackRunnable(frameTimeNanos);
-      getReactApplicationContext().runOnJSQueueThread(mCurrentIdleCallbackRunnable);
+      mReactApplicationContext.runOnJSQueueThread(mCurrentIdleCallbackRunnable);
 
       mReactChoreographer.postFrameCallback(ReactChoreographer.CallbackType.IDLE_EVENT, this);
     }
@@ -143,9 +131,7 @@ public final class Timing extends ReactContextBaseJavaModule
       }
 
       if (sendIdleEvents) {
-        getReactApplicationContext()
-            .getJSModule(JSTimers.class)
-            .callIdleCallbacks(absoluteFrameStartTime);
+        mJavaScriptTimerManager.callIdleCallbacks(absoluteFrameStartTime);
       }
 
       mCurrentIdleCallbackRunnable = null;
@@ -156,6 +142,10 @@ public final class Timing extends ReactContextBaseJavaModule
     }
   }
 
+  private final ReactApplicationContext mReactApplicationContext;
+  private final JavaScriptTimerManager mJavaScriptTimerManager;
+  private final ReactChoreographer mReactChoreographer;
+  private final DevSupportManager mDevSupportManager;
   private final Object mTimerGuard = new Object();
   private final Object mIdleCallbackGuard = new Object();
   private final PriorityQueue<Timer> mTimers;
@@ -164,15 +154,21 @@ public final class Timing extends ReactContextBaseJavaModule
   private final AtomicBoolean isRunningTasks = new AtomicBoolean(false);
   private final TimerFrameCallback mTimerFrameCallback = new TimerFrameCallback();
   private final IdleFrameCallback mIdleFrameCallback = new IdleFrameCallback();
-  private final ReactChoreographer mReactChoreographer;
   private @Nullable IdleCallbackRunnable mCurrentIdleCallbackRunnable;
   private boolean mFrameCallbackPosted = false;
   private boolean mFrameIdleCallbackPosted = false;
   private boolean mSendIdleEvents = false;
 
-  public Timing(ReactApplicationContext reactContext, DevSupportManager devSupportManager) {
-    super(reactContext);
+  public JavaTimerManager(
+      ReactApplicationContext reactContext,
+      JavaScriptTimerManager javaScriptTimerManager,
+      ReactChoreographer reactChoreographer,
+      DevSupportManager devSupportManager) {
+    mReactApplicationContext = reactContext;
+    mJavaScriptTimerManager = javaScriptTimerManager;
+    mReactChoreographer = reactChoreographer;
     mDevSupportManager = devSupportManager;
+
     // We store timers sorted by finish time.
     mTimers =
         new PriorityQueue<Timer>(
@@ -191,31 +187,19 @@ public final class Timing extends ReactContextBaseJavaModule
               }
             });
     mTimerIdsToTimers = new SparseArray<>();
-    mReactChoreographer = ReactChoreographer.getInstance();
   }
 
-  @Override
-  public void initialize() {
-    getReactApplicationContext().addLifecycleEventListener(this);
-    HeadlessJsTaskContext headlessJsTaskContext =
-        HeadlessJsTaskContext.getInstance(getReactApplicationContext());
-    headlessJsTaskContext.addTaskEventListener(this);
-  }
-
-  @Override
   public void onHostPause() {
     isPaused.set(true);
     clearFrameCallback();
     maybeIdleCallback();
   }
 
-  @Override
   public void onHostDestroy() {
     clearFrameCallback();
     maybeIdleCallback();
   }
 
-  @Override
   public void onHostResume() {
     isPaused.set(false);
     // TODO(5195192) Investigate possible problems related to restarting all tasks at the same
@@ -224,7 +208,6 @@ public final class Timing extends ReactContextBaseJavaModule
     maybeSetChoreographerIdleCallback();
   }
 
-  @Override
   public void onHeadlessJsTaskStart(int taskId) {
     if (!isRunningTasks.getAndSet(true)) {
       setChoreographerCallback();
@@ -232,10 +215,9 @@ public final class Timing extends ReactContextBaseJavaModule
     }
   }
 
-  @Override
   public void onHeadlessJsTaskFinish(int taskId) {
     HeadlessJsTaskContext headlessJsTaskContext =
-        HeadlessJsTaskContext.getInstance(getReactApplicationContext());
+        HeadlessJsTaskContext.getInstance(mReactApplicationContext);
     if (!headlessJsTaskContext.hasActiveTasks()) {
       isRunningTasks.set(false);
       clearFrameCallback();
@@ -243,13 +225,9 @@ public final class Timing extends ReactContextBaseJavaModule
     }
   }
 
-  @Override
-  public void onCatalystInstanceDestroy() {
+  public void onInstanceDestroy() {
     clearFrameCallback();
     clearChoreographerIdleCallback();
-    HeadlessJsTaskContext headlessJsTaskContext =
-        HeadlessJsTaskContext.getInstance(getReactApplicationContext());
-    headlessJsTaskContext.removeTaskEventListener(this);
   }
 
   private void maybeSetChoreographerIdleCallback() {
@@ -276,7 +254,7 @@ public final class Timing extends ReactContextBaseJavaModule
 
   private void clearFrameCallback() {
     HeadlessJsTaskContext headlessJsTaskContext =
-        HeadlessJsTaskContext.getInstance(getReactApplicationContext());
+        HeadlessJsTaskContext.getInstance(mReactApplicationContext);
     if (mFrameCallbackPosted && isPaused.get() && !headlessJsTaskContext.hasActiveTasks()) {
       mReactChoreographer.removeFrameCallback(
           ReactChoreographer.CallbackType.TIMERS_EVENTS, mTimerFrameCallback);
@@ -300,13 +278,33 @@ public final class Timing extends ReactContextBaseJavaModule
     }
   }
 
-  @Override
-  public String getName() {
-    return NAME;
+  /**
+   * A method to be used for synchronously creating a timer. The timer will not be invoked until the
+   * next frame, regardless of whether it has already expired (i.e. the delay is 0).
+   *
+   * @param callbackID An identifier for the callback that can be passed to JS or C++ to invoke it.
+   * @param delay The time in ms before the callback should be invoked.
+   * @param repeat Whether the timer should be repeated (used for setInterval).
+   */
+  public void createTimer(final int callbackID, final long delay, final boolean repeat) {
+    long initialTargetTime = SystemClock.nanoTime() / 1000000 + delay;
+    Timer timer = new Timer(callbackID, initialTargetTime, (int) delay, repeat);
+    synchronized (mTimerGuard) {
+      mTimers.add(timer);
+      mTimerIdsToTimers.put(callbackID, timer);
+    }
   }
 
-  @ReactMethod
-  public void createTimer(
+  /**
+   * A method to be used for asynchronously creating a timer. If the timer has already expired,
+   * (based on the provided jsSchedulingTime) then it will be immediately invoked.
+   *
+   * @param callbackID An identifier that can be passed back to JS to invoke the callback.
+   * @param duration The time in ms before the callback should be invoked.
+   * @param jsSchedulingTime The time (ms since epoch) when this timer was created in JS.
+   * @param repeat Whether the timer should be repeated (used for setInterval)
+   */
+  public void createAndMaybeCallTimer(
       final int callbackID,
       final int duration,
       final double jsSchedulingTime,
@@ -320,11 +318,9 @@ public final class Timing extends ReactContextBaseJavaModule
     if (mDevSupportManager.getDevSupportEnabled()) {
       long driftTime = Math.abs(remoteTime - deviceTime);
       if (driftTime > 60000) {
-        getReactApplicationContext()
-            .getJSModule(JSTimers.class)
-            .emitTimeDriftWarning(
-                "Debugger and device times have drifted by more than 60s. Please correct this by "
-                    + "running adb shell \"date `date +%m%d%H%M%Y.%S`\" on your debugger machine.");
+        mJavaScriptTimerManager.emitTimeDriftWarning(
+            "Debugger and device times have drifted by more than 60s. Please correct this by "
+                + "running adb shell \"date `date +%m%d%H%M%Y.%S`\" on your debugger machine.");
       }
     }
 
@@ -333,19 +329,13 @@ public final class Timing extends ReactContextBaseJavaModule
     if (duration == 0 && !repeat) {
       WritableArray timerToCall = Arguments.createArray();
       timerToCall.pushInt(callbackID);
-      getReactApplicationContext().getJSModule(JSTimers.class).callTimers(timerToCall);
+      mJavaScriptTimerManager.callTimers(timerToCall);
       return;
     }
 
-    long initialTargetTime = SystemClock.nanoTime() / 1000000 + adjustedDuration;
-    Timer timer = new Timer(callbackID, initialTargetTime, duration, repeat);
-    synchronized (mTimerGuard) {
-      mTimers.add(timer);
-      mTimerIdsToTimers.put(callbackID, timer);
-    }
+    createTimer(callbackID, adjustedDuration, repeat);
   }
 
-  @ReactMethod
   public void deleteTimer(int timerId) {
     synchronized (mTimerGuard) {
       Timer timer = mTimerIdsToTimers.get(timerId);
@@ -357,7 +347,6 @@ public final class Timing extends ReactContextBaseJavaModule
     }
   }
 
-  @ReactMethod
   public void setSendIdleEvents(final boolean sendIdleEvents) {
     synchronized (mIdleCallbackGuard) {
       mSendIdleEvents = sendIdleEvents;

@@ -26,14 +26,17 @@ namespace react {
 JavaTurboModule::JavaTurboModule(
     const std::string &name,
     jni::alias_ref<JTurboModule> instance,
-    std::shared_ptr<JSCallInvoker> jsInvoker)
-    : TurboModule(name, jsInvoker), instance_(jni::make_global(instance)) {}
+    std::shared_ptr<CallInvoker> jsInvoker,
+    std::shared_ptr<CallInvoker> nativeInvoker)
+    : TurboModule(name, jsInvoker),
+      instance_(jni::make_global(instance)),
+      nativeInvoker_(nativeInvoker) {}
 
 jni::local_ref<JCxxCallbackImpl::JavaPart>
 JavaTurboModule::createJavaCallbackFromJSIFunction(
     jsi::Function &function,
     jsi::Runtime &rt,
-    std::shared_ptr<JSCallInvoker> jsInvoker) {
+    std::shared_ptr<CallInvoker> jsInvoker) {
   auto wrapper = std::make_shared<react::CallbackWrapper>(
       std::move(function), rt, jsInvoker);
   callbackWrappers_.insert(wrapper);
@@ -216,14 +219,14 @@ std::vector<std::string> getMethodArgTypesFromSignature(
 // needs to be done again
 // TODO (axe) Reuse existing implementation as needed - the exist in
 // MethodInvoker.cpp
-std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
+JNIArgs JavaTurboModule::convertJSIArgsToJNIArgs(
     JNIEnv *env,
     jsi::Runtime &rt,
     std::string methodName,
     std::vector<std::string> methodArgTypes,
     const jsi::Value *args,
     size_t count,
-    std::shared_ptr<JSCallInvoker> jsInvoker,
+    std::shared_ptr<CallInvoker> jsInvoker,
     TurboModuleMethodValueKind valueKind) {
   unsigned int expectedArgumentCount = valueKind == PromiseKind
       ? methodArgTypes.size() - 1
@@ -234,8 +237,21 @@ std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
         methodName, count, expectedArgumentCount);
   }
 
-  auto jargs =
-      std::vector<jvalue>(valueKind == PromiseKind ? count + 1 : count);
+  JNIArgs jniArgs(valueKind == PromiseKind ? count + 1 : count);
+  auto &jargs = jniArgs.args_;
+  auto &globalRefs = jniArgs.globalRefs_;
+
+  auto makeGlobalIfNecessary =
+      [&globalRefs, env, valueKind](jobject obj) -> jobject {
+    if (valueKind == VoidKind) {
+      jobject globalObj = env->NewGlobalRef(obj);
+      globalRefs.push_back(globalObj);
+      env->DeleteLocalRef(obj);
+      return globalObj;
+    }
+
+    return obj;
+  };
 
   jclass booleanClass = nullptr;
   jclass doubleClass = nullptr;
@@ -292,8 +308,8 @@ std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
 
       jmethodID doubleConstructor =
           env->GetMethodID(doubleClass, "<init>", "(D)V");
-      jarg->l =
-          env->NewObject(doubleClass, doubleConstructor, arg->getNumber());
+      jarg->l = makeGlobalIfNecessary(
+          env->NewObject(doubleClass, doubleConstructor, arg->getNumber()));
       continue;
     }
 
@@ -309,8 +325,8 @@ std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
 
       jmethodID booleanConstructor =
           env->GetMethodID(booleanClass, "<init>", "(Z)V");
-      jarg->l =
-          env->NewObject(booleanClass, booleanConstructor, arg->getBool());
+      jarg->l = makeGlobalIfNecessary(
+          env->NewObject(booleanClass, booleanConstructor, arg->getBool()));
       continue;
     }
 
@@ -320,7 +336,8 @@ std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
             "string", argIndex, methodName, arg, &rt);
       }
 
-      jarg->l = env->NewStringUTF(arg->getString(rt).utf8(rt).c_str());
+      jarg->l = makeGlobalIfNecessary(
+          env->NewStringUTF(arg->getString(rt).utf8(rt).c_str()));
       continue;
     }
 
@@ -333,7 +350,7 @@ std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
       auto dynamicFromValue = jsi::dynamicFromValue(rt, *arg);
       auto jParams =
           ReadableNativeArray::newObjectCxxArgs(std::move(dynamicFromValue));
-      jarg->l = jParams.release();
+      jarg->l = makeGlobalIfNecessary(jParams.release());
       continue;
     }
 
@@ -344,7 +361,8 @@ std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
       }
 
       jsi::Function fn = arg->getObject(rt).getFunction(rt);
-      jarg->l = createJavaCallbackFromJSIFunction(fn, rt, jsInvoker).release();
+      jarg->l = makeGlobalIfNecessary(
+          createJavaCallbackFromJSIFunction(fn, rt, jsInvoker).release());
       continue;
     }
 
@@ -357,12 +375,12 @@ std::vector<jvalue> JavaTurboModule::convertJSIArgsToJNIArgs(
       auto dynamicFromValue = jsi::dynamicFromValue(rt, *arg);
       auto jParams =
           ReadableNativeMap::createWithContents(std::move(dynamicFromValue));
-      jarg->l = jParams.release();
+      jarg->l = makeGlobalIfNecessary(jParams.release());
       continue;
     }
   }
 
-  return jargs;
+  return jniArgs;
 }
 
 jsi::Value convertFromJMapToValue(JNIEnv *env, jsi::Runtime &rt, jobject arg) {
@@ -401,7 +419,15 @@ jsi::Value JavaTurboModule::invokeJavaMethod(
    * object. For normal returns, we just create the return object.
    */
   unsigned int maxReturnObjects = 3;
-  unsigned int estimatedLocalRefCount = argCount + maxReturnObjects + buffer;
+
+  /**
+   * When the return type is void, all JNI LocalReferences are converted to
+   * GlobalReferences. The LocalReferences are then promptly deleted
+   * after the conversion.
+   */
+  unsigned int actualArgCount = valueKind == VoidKind ? 0 : argCount;
+  unsigned int estimatedLocalRefCount =
+      actualArgCount + maxReturnObjects + buffer;
 
   /**
    * This will push a new JNI stack frame for the LocalReferences in this
@@ -435,7 +461,7 @@ jsi::Value JavaTurboModule::invokeJavaMethod(
   std::vector<std::string> methodArgTypes =
       getMethodArgTypesFromSignature(methodSignature);
 
-  std::vector<jvalue> jargs = convertJSIArgsToJNIArgs(
+  JNIArgs jniArgs = convertJSIArgsToJNIArgs(
       env,
       runtime,
       methodName,
@@ -445,10 +471,28 @@ jsi::Value JavaTurboModule::invokeJavaMethod(
       jsInvoker_,
       valueKind);
 
+  auto &jargs = jniArgs.args_;
+  auto &globalRefs = jniArgs.globalRefs_;
+
   switch (valueKind) {
     case VoidKind: {
-      env->CallVoidMethodA(instance, methodID, jargs.data());
-      FACEBOOK_JNI_THROW_PENDING_EXCEPTION();
+      nativeInvoker_->invokeAsync(
+          [jargs, globalRefs, methodID, instance_ = instance_]() mutable
+          -> void {
+            /**
+             * TODO(ramanpreet): Why do we have to require the environment
+             * again? Why does JNI crash when we use the env from the upper
+             * scope?
+             */
+            JNIEnv *env = jni::Environment::current();
+
+            env->CallVoidMethodA(instance_.get(), methodID, jargs.data());
+            FACEBOOK_JNI_THROW_PENDING_EXCEPTION();
+
+            for (auto globalRef : globalRefs) {
+              env->DeleteGlobalRef(globalRef);
+            }
+          });
 
       return jsi::Value::undefined();
     }
